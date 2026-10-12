@@ -1,0 +1,62 @@
+# Copyright 2025 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import json
+import logging
+
+import hydra
+import torch.multiprocessing as mp
+from omegaconf.omegaconf import OmegaConf
+
+from rlinf.config import validate_cfg
+from rlinf.runners.sft_runner import SFTRunner
+from rlinf.scheduler import Cluster
+from rlinf.utils.placement import HybridComponentPlacement
+from rlinf.utils.tactile_cache_policy import validate_training_future_cache_config
+from rlinf.workers.sft.fsdp_vla_sft_worker import FSDPVlaSftWorker
+
+mp.set_start_method("spawn", force=True)
+
+
+@hydra.main(version_base="1.1", config_path="config", config_name="simpletac_univtac")
+def main(cfg) -> None:
+    cfg = validate_cfg(cfg)
+    validate_training_future_cache_config(cfg)
+    logging.info(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))
+
+    cluster = Cluster(cluster_cfg=cfg.cluster)
+    component_placement = HybridComponentPlacement(cfg, cluster)
+
+    # Create actor worker group
+    actor_placement = component_placement.get_strategy("actor")
+
+    if cfg.actor.training_backend == "fsdp" or cfg.actor.training_backend == "fsdp2":
+        actor_group = FSDPVlaSftWorker.create_group(cfg).launch(
+            cluster, name=cfg.actor.group_name, placement_strategy=actor_placement
+        )
+
+    else:
+        raise ValueError(f"{cfg.actor.training_backend} backend is not supported yet")
+
+    runner = SFTRunner(
+        cfg=cfg,
+        actor=actor_group,
+    )
+
+    runner.init_workers()
+    runner.run()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,11 @@
+{
+  "registry_commit": "ce613c41372b23b1f51333815feb3edd87ef8a8b",
+  "port_tree": "79294fe8043f1405ad2595c7e4847e597951e3b5",
+  "version": "2.9.3",
+  "old_ref": "REF \"v${VERSION}\"",
+  "new_ref": "REF \"14ba27113ebd507ebeb7cba8ecaeab8df3921b27\"",
+  "old_sha512": "4f4d479a8ad8dd858340b0bfa5af4fdc9073279e59c4240918d5dfce94d2b50b87bc0acad0a2e7659d090dd4aa3b34b456550749fe57bb4f7b58ac2f2b6927aa",
+  "new_sha512": "ec1f272e4ff33caf7a1ba1fe8e002cdd1520e8ad5fc658ae2054181e05b0905b4697c1bed0dee601ecbcc13580da30d45775ef21b80ae681ad27eb2ab4d3e794",
+  "source_tree": "ff01f36a82dc72efb41acb90ee6a3db6797794f6",
+  "verification": "The v2.9.3 tag and immutable-commit archives were independently checked against all 1344 blobs of the official Git tree. No source changes or omissions. Only the download reference and archive checksum are replaced."
+}

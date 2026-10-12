@@ -1,0 +1,40 @@
+model_type: openpi_pytorch
+precision: fp32
+
+num_action_chunks: 50
+action_dim: 8
+num_steps: 10
+
+openpi:
+  pi05: true
+  task: sft
+  config_name: pi05_univtac
+  action_chunk: ${..num_action_chunks}
+  action_env_dim: ${..action_dim}
+  model_action_dim: 32
+  paligemma_variant: gemma_2b
+  action_expert_variant: gemma_300m
+  max_token_len: 200
+  discrete_state_input: true
+
+  tactile_encoder_path: ${oc.env:SIMPLETOUCH_T3_PATH,./assets/t3_large}
+  tactile_encoder_frozen: true
+  tactile_preprocess_profile: univtac_task_rgb_train_ep0_49_r256_cc224_v1
+  tactile_preprocess_task: ${data.task}
+
+  # Independent, layer-aligned expert; dimensions follow the Action Expert.
+  tactile_expert_enabled: true
+  tactile_expert_init_mode: random
+  tactile_expert_wam_mode: fast
+  tactile_expert_idm_condition_noise_prob: 0.5
+
+  # Current touch keeps full T3 tokens. Future targets keep CLS and a 6x6 grid.
+  tactile_expert_future_prediction_mode: multi_horizon_pooled
+  tactile_expert_future_stride: 5
+  tactile_expert_future_pool_grid: 6
+  tactile_expert_future_normalization: t3_reference_rms
+  tactile_expert_future_loss_weight: 0.01
+  tactile_expert_tail_supervision_mode: repeat
+
+  tactile_expert_future_attention_backend: sdpa
+  training_attention_backend: auto

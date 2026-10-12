@@ -1,0 +1,10 @@
+# Shared by EVERY pip installation into the simulation environment.
+# This is a compatibility constraint set, not a complete transitive lockfile.
+torch==2.5.1+cu124
+torchvision==0.20.1+cu124
+numpy==1.26.4
+setuptools<82
+warp-lang==1.0.0
+flatdict==4.0.1
+cmake==3.30.1
+mypy==2.3.1

@@ -1,0 +1,1037 @@
+# Copyright 2025 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import logging
+import os
+import re
+import signal
+import sys
+import tempfile
+import time
+from enum import Enum
+from importlib.metadata import version
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Optional
+
+import ray
+import ray.util.scheduling_strategies
+from omegaconf import DictConfig
+from packaging import version as vs
+from ray._private import ray_logging
+from ray.actor import ActorHandle
+from ray.util.state import list_actors
+
+from ..hardware.accelerators.accelerator import ProfileConfig
+from .config import ClusterConfig
+from .node import NodeGroupInfo, NodeInfo, NodeProbe
+from .utils import DistributedRayLogCollector, without_http_proxies
+
+ray_version = version("ray")
+assert vs.parse(ray_version) >= vs.parse("2.47.0"), (
+    "Ray version 2.47.0 or higher is required. Run pip install ray[default]==2.47.0"
+)
+
+if TYPE_CHECKING:
+    from ..manager import Manager
+    from ..worker import Worker
+
+
+class ClusterEnvVar(str, Enum):
+    """Scheduler environment variables. All env vars are prefixed with {Cluster.SYS_NAME}_ in usage."""
+
+    CATCH_FAILURE = "CATCH_FAILURE"
+    """Whether to catch failures in workers to avoid exiting the main process."""
+
+    LOG_LEVEL = "LOG_LEVEL"
+    """Logging level for the cluster and workers."""
+
+    TIMEOUT = "TIMEOUT"
+    """Timeout for the all inter-worker communications."""
+
+    NODE_RANK = "NODE_RANK"
+    """Rank of each node in the cluster."""
+
+    COMM_NET_DEVICES = "COMM_NET_DEVICES"
+    """Network devices to use for inter-node communication."""
+
+    EXT_MODULE = "EXT_MODULE"
+    """Load extension modules specified via EXT_MODULE environment variable.
+
+    This allows users to register custom environments, models, or other extensions
+    without patching.
+    The extension module should have a `register()` function that performs the necessary registrations.
+
+    Example usage:
+        export RLINF_EXT_MODULE=rlinf_ext
+        # or with full path:
+        export RLINF_EXT_MODULE=workflows.scripts.rlinf_ext
+    """
+
+    PATH_ENV_MERGE_MODE = "PATH_ENV_MERGE_MODE"
+    """How to merge path-like env vars when allocating workers.
+
+    Supported modes:
+        - append: keep both new and existing path entries (default)
+        - override: replace existing value with the new value
+    """
+
+    CODE_WORKING_DIR = "CODE_WORKING_DIR"
+    """Enable shipping the ``rlinf`` Python package to workers via Ray ``runtime_env`` (``py_modules``).
+
+    Only the ``rlinf/`` subdirectory of the checkout is packaged (not ``examples/``, ``docs/``, etc.).
+
+    Values (``RLINF_CODE_WORKING_DIR``):
+        - Unset / ``0`` / ``false`` / ``off`` / ``no``: disabled (same as legacy behavior: no Ray code sync).
+        - ``auto``: infer checkout root from the installed ``rlinf`` package / ``pyproject.toml``.
+        - Absolute path: repository root containing ``pyproject.toml`` and ``rlinf/``, or the ``rlinf`` package dir.
+
+    Set explicitly when workers do not share a filesystem with the launch node.
+    """
+
+
+class PathEnvMergeMode(str, Enum):
+    """Merge mode for path-like worker env vars."""
+
+    APPEND = "append"
+    OVERRIDE = "override"
+
+
+class Cluster:
+    """A singleton class that manages the cluster resources for Ray workers."""
+
+    SYS_NAME = "RLinf"
+    NAMESPACE = SYS_NAME
+    LOGGING_LEVEL = os.getenv(
+        f"{SYS_NAME.upper()}_{ClusterEnvVar.LOG_LEVEL.value}", "INFO"
+    ).upper()
+    TIMEOUT_WARN_TIME = 3600000
+    DEFAULT_SYS_ENV_VAR = {
+        ClusterEnvVar.CATCH_FAILURE: "0",
+        ClusterEnvVar.LOG_LEVEL: "INFO",
+        ClusterEnvVar.TIMEOUT: "180",
+        ClusterEnvVar.NODE_RANK: None,
+        ClusterEnvVar.COMM_NET_DEVICES: None,
+        ClusterEnvVar.EXT_MODULE: None,
+        ClusterEnvVar.PATH_ENV_MERGE_MODE: PathEnvMergeMode.APPEND.value,
+        ClusterEnvVar.CODE_WORKING_DIR: "0",
+    }
+    PATH_LIKE_ENV_VARS = {
+        "PYTHONPATH",
+        "LD_LIBRARY_PATH",
+        "PATH",
+        "LIBRARY_PATH",
+        "CMAKE_PREFIX_PATH",
+        "PKG_CONFIG_PATH",
+        "CPATH",
+    }
+
+    class NamespaceConflictError(Exception):
+        """Raised when there is a namespace conflict in Ray initialization."""
+
+    @classmethod
+    def find_free_port(cls):
+        """Find a free port on the node."""
+        import socket
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+
+    @classmethod
+    def has_initialized(cls):
+        """Check if the cluster has been initialized."""
+        return hasattr(cls, "_instance") and cls._instance is not None
+
+    def __new__(cls, *args, **kwargs):  # noqa D417
+        """Create a singleton class that manages the cluster resources for Ray workers."""
+        if not hasattr(cls, "_instance"):
+            cls._instance = super().__new__(cls)
+            cls._instance._has_initialized = False
+        return cls._instance
+
+    def __init__(
+        self,
+        num_nodes: Optional[int] = None,
+        cluster_cfg: Optional[DictConfig] = None,
+        distributed_log_dir: Optional[str] = None,
+    ):
+        """Initialize the cluster.
+
+        Args:
+            num_nodes (int): The number of nodes in the cluster. When you wish to acquire the cluster instance in a processes other than the main driver process, do not pass this argument. Instead, use the `Cluster()` constructor without arguments. If num_nodes is 0, it will initialize the cluster with all ray-connected nodes.
+            cluster_cfg (Optional[DictConfig]): The cluster's configuration dictionary. If set, num_nodes will be ignored and inferred from the config.
+            distributed_log_dir (Optional[str]): Output directory for split logs. This must be provided when ``distributed_logging`` is True.
+        """
+        if self._has_initialized:
+            return
+        self._setup_logger()
+        self._distributed_log_collector: Optional[DistributedRayLogCollector] = None
+        self._ray_code_sync_fragment: Optional[dict[str, Any]] = None
+        self._runtime_code_sync_strip_roots: tuple[str, ...] = ()
+        if num_nodes is not None or cluster_cfg is not None:
+            self._ray_instance_count = 0
+            while True:
+                try:
+                    self._init_and_launch_managers(
+                        num_nodes,
+                        cluster_cfg,
+                        distributed_log_dir,
+                    )
+                    break
+                except Cluster.NamespaceConflictError:
+                    # Switch the namespace when multiple ray instances are created in the same node
+                    self._ray_instance_count += 1
+                    self._logger.info(
+                        f"Ray namespace conflict detected. Retrying to initialize Cluster with a new namespace (attempt {self._ray_instance_count})."
+                    )
+                    Cluster.NAMESPACE = f"{Cluster.SYS_NAME}_{self._ray_instance_count}"
+        else:
+            try:
+                self._init_from_existing_managers()
+            except ConnectionError:
+                self._logger.warning(
+                    "Could not connect to an existing Ray cluster. Initializing a new cluster with all connected nodes."
+                )
+                return self.__init__(
+                    num_nodes=0,
+                    distributed_log_dir=distributed_log_dir,
+                )
+
+        self._has_initialized = True
+
+    def _setup_logger(self):
+        # Add logger
+        self._logger = logging.getLogger(Cluster.SYS_NAME)
+        self._logger.setLevel(Cluster.LOGGING_LEVEL)
+        self._logger.propagate = False
+        for handler in self._logger.handlers:
+            self._logger.removeHandler(handler)
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter(
+            fmt="[%(levelname)s %(asctime)s %(name)s] %(message)s",
+            datefmt="%H:%M:%S",
+        )
+        handler.setFormatter(formatter)
+        self._logger.addHandler(handler)
+
+    @staticmethod
+    def _get_manager_node(nodes: list[NodeInfo]) -> NodeInfo:
+        """Return the alive node that hosts all global manager actors."""
+        manager_node = next(
+            (node for node in nodes if node.node_rank == 0),
+            None,
+        )
+        assert manager_node is not None, (
+            "All managers must be launched on node rank 0, "
+            "but node rank 0 is unavailable."
+        )
+        return manager_node
+
+    def _launch_manager_actor(
+        self,
+        manager_cls: type["Manager"],
+        manager_node: NodeInfo,
+        runtime_env: dict[str, Any],
+        *args,
+    ) -> ActorHandle:
+        """Launch a global manager actor pinned to cluster node rank 0."""
+        combined_runtime_env = Cluster._combine_ray_runtime_env(
+            Cluster._job_code_sync_fragment_for_child_runtime_env(
+                self._ray_code_sync_fragment
+            ),
+            runtime_env,
+        )
+        return (
+            ray.remote(manager_cls)
+            .options(
+                name=manager_cls.MANAGER_NAME,
+                runtime_env=combined_runtime_env,
+                scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                    node_id=manager_node.ray_id,
+                    soft=False,
+                ),
+            )
+            .remote(*args)
+        )
+
+    def _init_and_launch_managers(
+        self,
+        num_nodes: int,
+        cluster_cfg: Optional[DictConfig],
+        distributed_log_dir: Optional[str],
+    ):
+        if ray.is_initialized():
+            if self._ray_instance_count > 0:
+                # For reinit Ray to switch namespace
+                ray.shutdown()
+            else:
+                # Initializing Ray before us interferes with the namespace and logging level settings.
+                raise RuntimeError(
+                    "You have initialized Ray before creating the Cluster instance. This may be due to calling ray.init or creating certain Ray objects like Ray Queue before instantiating the Cluster class. Please ensure that the Cluster class is instantiated before Ray is initialized because it will interfere with our Ray namespace and logging settings."
+                )
+
+        # NOTE: Add os.environ variables to the worker environment.
+        # When ray cluster has been started via `ray start` before running the Python script, ray will only capture the environment variables exported before `ray start` and ignore all subsequently exported environment variables.
+        # To handle this, we need to manually pass the environment variables to Ray when initializing the cluster.
+        # Any env vars conflicting with Worker env vars will be overwritten by Worker.
+        if "RAY_DEDUP_LOGS" not in os.environ:
+            # Default disabling deduplication of logs to ensure all logs are printed.
+            ray_logging.RAY_DEDUP_LOGS = 0
+        if "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO" not in os.environ:
+            os.environ["RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"] = "0"
+
+        # Cluster configurations
+        self._cluster_cfg = (
+            ClusterConfig.from_dict_cfg(cluster_cfg) if cluster_cfg else None
+        )
+        if (
+            self._cluster_cfg is not None
+            and num_nodes is not None
+            and self._cluster_cfg.num_nodes != num_nodes
+        ):
+            raise ValueError(
+                f"num_nodes ({num_nodes}) passed in Cluster init does not match the number of nodes in configuration ({self._cluster_cfg.num_nodes}). Please ensure they are consistent."
+            )
+        self._num_nodes = (
+            self._cluster_cfg.num_nodes if self._cluster_cfg is not None else num_nodes
+        )
+        assert self._num_nodes >= 0, "num_nodes must be greater than or equal to 0."
+
+        self._ray_code_sync_fragment, self._runtime_code_sync_strip_roots = (
+            Cluster._prepare_ray_code_sync_runtime_env_fragment()
+        )
+
+        try:
+            # First try to connect to an existing Ray cluster
+            ray_init_kwargs: dict[str, Any] = {
+                "address": "auto",
+                "logging_level": Cluster.LOGGING_LEVEL,
+                "namespace": Cluster.NAMESPACE,
+            }
+            if self._ray_code_sync_fragment is not None:
+                ray_init_kwargs["runtime_env"] = dict(self._ray_code_sync_fragment)
+                py_mods = ray_init_kwargs["runtime_env"].get("py_modules") or ()
+                self._logger.info(
+                    "%s Ray code sync is enabled (py_modules=%r); workers receive "
+                    "only the rlinf package from the launch node. Disable with %s=0.",
+                    Cluster.SYS_NAME,
+                    tuple(py_mods),
+                    Cluster.get_full_env_var_name(ClusterEnvVar.CODE_WORKING_DIR),
+                )
+            ray.init(**ray_init_kwargs)
+        except ConnectionError:
+            ray_init_kwargs = {
+                "logging_level": Cluster.LOGGING_LEVEL,
+                "namespace": Cluster.NAMESPACE,
+            }
+            if self._ray_code_sync_fragment is not None:
+                ray_init_kwargs["runtime_env"] = dict(self._ray_code_sync_fragment)
+            ray.init(**ray_init_kwargs)
+
+        # Ray log collector
+        if distributed_log_dir is not None:
+            self._distributed_log_collector = DistributedRayLogCollector(
+                logger=self._logger,
+                output_dir=distributed_log_dir,
+                namespace=Cluster.NAMESPACE,
+            )
+            self._distributed_log_collector.start()
+
+        # If num_nodes is 0, infer the number of nodes from the connected Ray cluster
+        if self._num_nodes == 0:
+            self._num_nodes = len(Cluster.get_alive_nodes())
+
+        # Wait for the cluster to be ready
+        while len(Cluster.get_alive_nodes()) < self._num_nodes:
+            self._logger.warning(
+                f"Waiting for {self._num_nodes} nodes to be ready, currently {len(Cluster.get_alive_nodes())} nodes available."
+            )
+            time.sleep(1)
+
+        # Get node info
+        self._node_probe = NodeProbe(self._num_nodes, self._cluster_cfg)
+        self._nodes = self._node_probe.nodes
+        self._node_groups = self._node_probe.node_groups
+
+        self._logger.info(
+            f"{Cluster.SYS_NAME} is running on a cluster with {len(self._nodes)} node{'s' if len(self._nodes) > 1 else ''} and {self.num_accelerators} accelerator{'s' if self.num_accelerators > 1 else ''}. The nodes' details are: "
+            + "\n"
+            + "\n".join(str(node) for node in self._nodes)
+            + "\n"
+            + "Node groups' details are: \n"
+            + "\n".join(str(group) for group in self._node_groups)
+        )
+
+        # Set environment variables
+        self._set_scheduler_env_vars()
+
+        # Launch managers
+        from ..manager import (
+            CollectiveManager,
+            DeviceLockManager,
+            Manager,
+            NodeManager,
+            PortLockManager,
+            WorkerManager,
+        )
+
+        try:
+            runtime_env = {"env_vars": Manager.get_runtime_env_vars()}
+            manager_node = self._get_manager_node(self._nodes)
+            self._worker_manager = self._launch_manager_actor(
+                WorkerManager, manager_node, runtime_env
+            )
+            self._coll_manager = self._launch_manager_actor(
+                CollectiveManager, manager_node, runtime_env
+            )
+            self._node_manager = self._launch_manager_actor(
+                NodeManager,
+                manager_node,
+                runtime_env,
+                self._nodes,
+                self._node_groups,
+                self._cluster_cfg,
+            )
+            self._device_lock_manager = self._launch_manager_actor(
+                DeviceLockManager, manager_node, runtime_env
+            )
+            self._port_lock_manager = self._launch_manager_actor(
+                PortLockManager, manager_node, runtime_env
+            )
+        except ValueError:
+            raise Cluster.NamespaceConflictError
+
+        def signal_handler(sig, frame):
+            # Exit the main process if SIGUSR1 is received, which is sent by the worker group when an exception occurs.
+            sys.stdout.flush()
+            sys.stderr.flush()
+            if self._distributed_log_collector is not None:
+                self._distributed_log_collector.stop()
+
+            with without_http_proxies():
+                alive_actors = list_actors(
+                    filters=[
+                        ("STATE", "=", "ALIVE"),
+                        ("RAY_NAMESPACE", "=", Cluster.NAMESPACE),
+                    ]
+                )
+            for actor_state in alive_actors:
+                actor = ray.get_actor(actor_state.name)
+                ray.kill(actor, no_restart=True)
+
+            if ray.is_initialized():
+                # Mimic ray's sleep before shutdown to ensure log messages are flushed
+                time.sleep(0.5)
+                ray.shutdown(_exiting_interpreter=True)
+            print("Exiting main process due to a failure upon worker execution.")
+            exit(-1)
+
+        signal.signal(signal.SIGUSR1, signal_handler)
+
+    def _init_from_existing_managers(self):
+        if not ray.is_initialized():
+            ray.init(
+                address="auto",
+                namespace=Cluster.NAMESPACE,
+                logging_level=Cluster.LOGGING_LEVEL,
+            )
+
+        from ..manager.node_manager import NodeManager
+
+        try:
+            self._node_manager = NodeManager.get_proxy(no_wait=True)
+        except ValueError:
+            ray.shutdown()
+            raise ConnectionError
+        self._nodes, self._node_groups, self._cluster_cfg = (
+            self._node_manager.get_nodes()
+        )
+        self._num_nodes = len(self._nodes)
+
+    @staticmethod
+    def get_full_env_var_name(var: ClusterEnvVar) -> str:
+        """Get the full environment variable name with system prefix."""
+        return f"{Cluster.SYS_NAME.upper()}_{var.value}"
+
+    def _set_scheduler_env_vars(self):
+        """Set default environment variables for the system."""
+        env_var_list = list(ClusterEnvVar._value2member_map_.values())
+        for node in self._nodes:
+            for env_var in env_var_list:
+                env_var_name = Cluster.get_full_env_var_name(env_var)
+                if env_var_name in os.environ and env_var_name not in node.env_vars:
+                    node.env_vars[env_var_name] = os.environ[env_var_name]
+                elif (
+                    default_value := Cluster.DEFAULT_SYS_ENV_VAR[env_var]
+                ) is not None and env_var_name not in node.env_vars:
+                    node.env_vars[env_var_name] = default_value
+
+    @staticmethod
+    def get_sys_env_var(
+        env_var: ClusterEnvVar, default: Optional[str] = None
+    ) -> Optional[str]:
+        """Get the system environment variable for the cluster."""
+        return os.environ.get(Cluster.get_full_env_var_name(env_var), default)
+
+    @property
+    def num_nodes(self):
+        """Get the number of nodes in the cluster."""
+        return self._num_nodes
+
+    @property
+    def num_accelerators(self):
+        """Get the number of accelerators in the cluster."""
+        return sum(node.num_accelerators for node in self._nodes)
+
+    @property
+    def accelerator_ranks(self) -> list[list[int]]:
+        """Get the global accelerator ranks for each node in the cluster."""
+        node_start_accel_rank = 0
+        node_accel_ranks = []
+        for node in self._nodes:
+            node_accel_ranks.append(
+                list(
+                    range(
+                        node_start_accel_rank,
+                        node_start_accel_rank + node.num_accelerators,
+                    )
+                )
+            )
+            node_start_accel_rank += node.num_accelerators
+        return node_accel_ranks
+
+    @staticmethod
+    def get_alive_nodes():
+        """Get the list of alive nodes in the Ray cluster."""
+        return [node for node in ray.nodes() if node["Alive"]]
+
+    def get_node_group(
+        self, label: Optional[str] = NodeGroupInfo.DEFAULT_GROUP_LABEL
+    ) -> Optional[NodeGroupInfo]:
+        """Get the node group information by label.
+
+        Args:
+            label (Optional[str]): The label of the node group.
+
+        Returns:
+            Optional[NodeGroupInfo]: The node group information.
+        """
+        if label is None:
+            label = NodeGroupInfo.DEFAULT_GROUP_LABEL
+        label = str(label)
+        return next((ng for ng in self._node_groups if ng.label == label), None)
+
+    def get_node_info(self, node_rank: int):
+        """Get the NodeInfo of a specific node rank."""
+        if node_rank < 0 or node_rank >= self._num_nodes:
+            raise ValueError(
+                f"Invalid node_id: {node_rank}. Must be between 0 and {self._num_nodes - 1}."
+            )
+        assert self._nodes[node_rank].node_rank == node_rank, (
+            f"Nodes are not correctly sorted in the cluster. The {node_rank}-th node's node_rank is {self._nodes[node_rank].node_rank}."
+        )
+        return self._nodes[node_rank]
+
+    def get_node_ip(self, node_rank: int) -> str:
+        """Get the IP address of a specific node by its rank."""
+        return self._nodes[node_rank].node_ip
+
+    @staticmethod
+    def _sanitize_worker_name_for_path(worker_name: str) -> str:
+        """Sanitize worker names for use in output filenames."""
+        return re.sub(r"[^A-Za-z0-9._-]", "_", worker_name)
+
+    @classmethod
+    def _get_default_profiling_output_prefix(
+        cls,
+        worker_name: str,
+        output_dir: str,
+    ) -> str:
+        safe_worker_name = cls._sanitize_worker_name_for_path(worker_name)
+        return os.path.join(output_dir, f"rlinf_profile_{safe_worker_name}_%p")
+
+    @classmethod
+    def modify_profile_context(
+        cls,
+        python_interpreter_path: str,
+        worker_name: str,
+        profiling_cfg: Optional[ProfileConfig],
+    ) -> str:
+        """Wrap ``py_executable`` with a profiler command if profiling is configured.
+
+        Dispatches to the accelerator manager that owns the profiling config type,
+        so all profiler-specific CLI construction stays in the hardware layer.
+        """
+        if profiling_cfg is None:
+            return python_interpreter_path
+
+        from ..hardware.accelerators.accelerator import AcceleratorManager
+        from ..manager import WorkerAddress
+
+        worker_group_name = WorkerAddress.from_name(worker_name).root_group_name
+        if not profiling_cfg.profiles_worker_group(worker_group_name):
+            return python_interpreter_path
+
+        # Resolve the accelerator manager registered for this profiling config class.
+        manager = None
+        for accel_type, cfg_cls in AcceleratorManager.profiling_config_register.items():
+            if isinstance(profiling_cfg, cfg_cls):
+                manager = AcceleratorManager.manager_register.get(accel_type)
+                break
+
+        if manager is None:
+            return python_interpreter_path
+
+        if profiling_cfg.output_dir is None:
+            output_dir = tempfile.gettempdir()
+
+            from rlinf.utils.logging import get_logger
+
+            get_logger().warning(
+                f"Profiling is enabled for worker group '{worker_group_name}' but no "
+                f"output directory is configured. Reports will be saved to: {output_dir}."
+            )
+        else:
+            output_dir = profiling_cfg.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        output_prefix = cls._get_default_profiling_output_prefix(
+            worker_name,
+            output_dir=output_dir,
+        )
+
+        return manager.modify_profiling_context(
+            python_interpreter_path, profiling_cfg, output_prefix
+        )
+
+    @classmethod
+    def get_profiling_env_vars_for_worker(
+        cls,
+        worker_name: str,
+        profiling_cfg: Optional[ProfileConfig],
+    ) -> dict[str, str]:
+        """Return backend-specific env vars to inject when profiling is active.
+
+        Called alongside :meth:`modify_profile_context`; the
+        returned dict is merged into the worker's environment so that backends
+        relying on env-var configuration (e.g. ``ROCPROFSYS_OUTPUT_PATH``) work
+        without requiring manual ``node_groups.env_configs`` entries.
+
+        Returns an empty dict when profiling is disabled or no env vars are needed.
+        """
+        if profiling_cfg is None:
+            return {}
+
+        from ..hardware.accelerators.accelerator import AcceleratorManager
+        from ..manager import WorkerAddress
+
+        worker_group_name = WorkerAddress.from_name(worker_name).root_group_name
+        if not profiling_cfg.profiles_worker_group(worker_group_name):
+            return {}
+
+        manager = None
+        for accel_type, cfg_cls in AcceleratorManager.profiling_config_register.items():
+            if isinstance(profiling_cfg, cfg_cls):
+                manager = AcceleratorManager.manager_register.get(accel_type)
+                break
+
+        if manager is None:
+            return {}
+
+        output_dir = profiling_cfg.output_dir or tempfile.gettempdir()
+        os.makedirs(output_dir, exist_ok=True)
+        output_prefix = cls._get_default_profiling_output_prefix(
+            worker_name, output_dir=output_dir
+        )
+        return manager.get_profiling_env_vars(profiling_cfg, output_prefix)
+
+    def allocate(
+        self,
+        cls: type["Worker"],
+        worker_name: str,
+        worker_rank: int,
+        node_rank: int,
+        max_concurrency: int,
+        env_vars: dict,
+        node_group_label: str,
+        disable_distributed_log: bool,
+        cls_args: tuple,
+        cls_kwargs: dict,
+    ) -> ActorHandle:
+        """Allocate a ray remote class instance on a specific node and local rank.
+
+        Args:
+            cls (Type[Worker]): The class to allocate.
+            worker_name (str): The name of the worker.
+            worker_rank (int): The rank of the worker in the worker group.
+            node_rank (int): The rank of the node to allocate on.
+            max_concurrency (Optional[int]): The maximum concurrency for the worker's underlying ray actor.
+            env_vars (dict): Environment variables to set for the worker.
+            node_group_label (str): The label of the node group to allocate on.
+            disable_distributed_log (bool): Whether to disable distributed log for the worker.
+            cls_args (tuple): Positional arguments to pass to the class constructor.
+            cls_kwargs (dict): Keyword arguments to pass to the class constructor.
+
+        Returns:
+            ray.ObjectRef: A reference to the allocated remote class instance.
+
+        """
+        if node_rank < 0 or node_rank >= self._num_nodes:
+            raise ValueError(
+                f"Invalid node_id: {node_rank}. Must be between 0 and {self._num_nodes - 1}."
+            )
+
+        node = self._nodes[node_rank]
+        node_group = self.get_node_group(node_group_label)
+        remote_cls = ray.remote(cls)
+
+        merged_env_vars = node.env_vars.copy()
+        path_env_merge_mode = self.get_path_env_merge_mode(merged_env_vars)
+        # Update with user-specified env vars in node group configs
+        cfg_node_env_vars = node_group.get_node_env_vars(node_rank)
+        merged_env_vars = self.merge_worker_env_vars(
+            merged_env_vars,
+            cfg_node_env_vars,
+            path_env_merge_mode,
+        )
+        # Finally, update with worker-specified env vars
+        merged_env_vars = self.merge_worker_env_vars(
+            merged_env_vars,
+            env_vars,
+            path_env_merge_mode,
+        )
+
+        # Update Python interpreter path
+        python_interpreter_path = node.python_interpreter_path
+        cfg_python_path = node_group.get_node_python_interpreter_path(node_rank)
+        if cfg_python_path is not None:
+            python_interpreter_path = cfg_python_path
+
+        _profiling_cfg = (
+            self._cluster_cfg.profiling if self._cluster_cfg is not None else None
+        )
+        if _profiling_cfg is not None:
+            from ..manager import WorkerAddress
+
+            worker_group_name = WorkerAddress.from_name(worker_name).root_group_name
+            if (
+                _profiling_cfg.profiles_worker_group(worker_group_name)
+                and _profiling_cfg.backend not in node.profiler_backends
+            ):
+                raise RuntimeError(
+                    f"Profiling backend '{_profiling_cfg.backend}' is enabled for worker "
+                    f"group '{worker_group_name}' but is not available on node "
+                    f"{node.node_rank} ({node.node_ip}). "
+                    f"Available backends: {node.profiler_backends}. "
+                    f"Please install the required tools before running with profiling enabled."
+                )
+        python_interpreter_path = self.modify_profile_context(
+            python_interpreter_path=python_interpreter_path,
+            worker_name=worker_name,
+            profiling_cfg=_profiling_cfg,
+        )
+        profiling_env_vars = self.get_profiling_env_vars_for_worker(
+            worker_name=worker_name,
+            profiling_cfg=_profiling_cfg,
+        )
+        if profiling_env_vars:
+            merged_env_vars = self.merge_worker_env_vars(
+                merged_env_vars,
+                profiling_env_vars,
+                path_env_merge_mode,
+            )
+
+        if self._runtime_code_sync_strip_roots:
+            merged_env_vars = Cluster._strip_sync_roots_from_pythonpath(
+                merged_env_vars,
+                self._runtime_code_sync_strip_roots,
+            )
+        runtime_env_worker = Cluster._combine_ray_runtime_env(
+            Cluster._job_code_sync_fragment_for_child_runtime_env(
+                self._ray_code_sync_fragment
+            ),
+            {
+                "py_executable": python_interpreter_path,
+                "env_vars": merged_env_vars,
+            },
+        )
+
+        options = {
+            "runtime_env": runtime_env_worker,
+            "name": worker_name,
+            "scheduling_strategy": ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                node_id=node.ray_id,
+                soft=False,
+            ),
+        }
+        if max_concurrency is not None:
+            assert 1 <= max_concurrency <= 2**31 - 1, (
+                f"Invalid max_concurrency: {max_concurrency}. Must be between 1 and {2**31 - 1} (max int32) due to Ray's native layer limitation."
+            )
+            options["max_concurrency"] = max_concurrency
+
+        actor = remote_cls.options(**options).remote(*cls_args, **cls_kwargs)
+        if self._distributed_log_collector is not None and not disable_distributed_log:
+            self._distributed_log_collector.register_worker(
+                worker_name=worker_name,
+                rank=worker_rank,
+                actor_handle=actor,
+            )
+        return actor
+
+    @classmethod
+    def get_path_env_merge_mode(cls, env_vars: dict[str, str]) -> PathEnvMergeMode:
+        """Resolve the path-like env merge mode from environment variables."""
+        env_key = cls.get_full_env_var_name(ClusterEnvVar.PATH_ENV_MERGE_MODE)
+        mode_str = env_vars.get(
+            env_key, cls.DEFAULT_SYS_ENV_VAR[ClusterEnvVar.PATH_ENV_MERGE_MODE]
+        )
+        mode_str = str(mode_str).lower()
+        try:
+            return PathEnvMergeMode(mode_str)
+        except ValueError:
+            logging.error(
+                f"Invalid {env_key}={mode_str}. "
+                f"Expected one of {[mode.value for mode in PathEnvMergeMode]}. "
+                "Falling back to append."
+            )
+            return PathEnvMergeMode.APPEND
+
+    @classmethod
+    def merge_worker_env_vars(
+        cls,
+        base_env_vars: dict[str, str],
+        incoming_env_vars: dict[str, str],
+        mode: PathEnvMergeMode,
+    ) -> dict[str, str]:
+        """Merge worker env vars with special handling for path-like variables."""
+        merged = base_env_vars.copy()
+        for key, value in incoming_env_vars.items():
+            if (
+                key in Cluster.PATH_LIKE_ENV_VARS
+                and key in merged
+                and mode == PathEnvMergeMode.APPEND
+            ):
+                merged[key] = cls._merge_path_like_env_value(
+                    env_var_name=key,
+                    existing_value=merged[key],
+                    incoming_value=value,
+                )
+            else:
+                merged[key] = value
+        return merged
+
+    @staticmethod
+    def _split_path_entries(path_value: Optional[str]) -> list[str]:
+        if path_value is None:
+            return []
+        return [entry for entry in str(path_value).split(os.pathsep) if entry]
+
+    @staticmethod
+    def _dedupe_path_entries(entries: list[str]) -> list[str]:
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for entry in entries:
+            if entry not in seen:
+                deduped.append(entry)
+                seen.add(entry)
+        return deduped
+
+    @staticmethod
+    def _merge_path_like_env_value(
+        env_var_name: str,
+        existing_value: str,
+        incoming_value: str,
+    ) -> str:
+        """Merge path-like env values with append semantics."""
+        if env_var_name not in Cluster.PATH_LIKE_ENV_VARS:
+            # Safety guard: never apply path-like merge semantics to non-whitelisted vars.
+            return incoming_value
+        existing_entries = Cluster._split_path_entries(existing_value)
+        incoming_entries = Cluster._split_path_entries(incoming_value)
+        merged_entries = Cluster._dedupe_path_entries(
+            incoming_entries + existing_entries
+        )
+        return os.pathsep.join(merged_entries)
+
+    @staticmethod
+    def _combine_ray_runtime_env(
+        fragment: Optional[dict[str, Any]],
+        overlay: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Merge Ray ``runtime_env`` dicts without dropping ``fragment`` extras (``py_modules``, ``working_dir``, …)."""
+        merged: dict[str, Any] = dict(fragment or {})
+        overlay_copy = dict(overlay)
+        overlay_vars = overlay_copy.pop("env_vars", None)
+        merged_vars = dict(merged.pop("env_vars", None) or {})
+        merged.update(overlay_copy)
+        if overlay_vars:
+            merged_vars.update(overlay_vars)
+        if merged_vars:
+            merged["env_vars"] = merged_vars
+        return merged
+
+    @staticmethod
+    def _job_code_sync_fragment_for_child_runtime_env(
+        job_fragment: Optional[dict[str, Any]],
+    ) -> Optional[dict[str, Any]]:
+        """Return a copy of the job-level code-sync fragment safe for actor/task ``runtime_env``.
+
+        Ray only accepts local ``py_modules`` / ``working_dir`` on ``ray.init``; packaging then applies
+        to the whole job. Passing the same local paths on ``.options(runtime_env=...)`` raises
+        ``ValueError: ... is not a valid URI`` (see Ray ``_validate_no_local_paths``).
+        Child actors inherit the driver's job runtime environment, so these keys must be omitted.
+        """
+        if not job_fragment:
+            return None
+        stripped = {
+            k: v
+            for k, v in job_fragment.items()
+            if k not in ("py_modules", "working_dir")
+        }
+        return stripped or None
+
+    @classmethod
+    def _infer_rlinf_repo_root_for_ray_working_dir(cls) -> str:
+        """Find the RLinf checkout root (directory containing ``pyproject.toml``)."""
+        import rlinf
+
+        cur = Path(rlinf.__file__).resolve().parent
+        for _ in range(12):
+            if (cur / "pyproject.toml").is_file():
+                return str(cur)
+            if cur.parent == cur:
+                break
+            cur = cur.parent
+        cwd = Path.cwd()
+        if (cwd / "pyproject.toml").is_file() and (cwd / "rlinf").is_dir():
+            return str(cwd.resolve())
+        raise RuntimeError(
+            f"{cls.SYS_NAME} could not infer the repo root for "
+            f"{cls.get_full_env_var_name(ClusterEnvVar.CODE_WORKING_DIR)}=auto "
+            "(no pyproject.toml parent of `rlinf` and current directory is not "
+            "an RLinf checkout). Set RLINF_CODE_WORKING_DIR to an absolute "
+            "path of the repo on the launch node."
+        )
+
+    @staticmethod
+    def _paths_equivalent_for_code_sync(left: str, right_canonical: str) -> bool:
+        """Whether ``left`` resolves to the same directory as launch-node repo root."""
+        try:
+            l_c = os.path.normcase(os.path.realpath(os.path.expanduser(left)))
+            r_c = os.path.normcase(os.path.realpath(right_canonical))
+            return l_c == r_c
+        except OSError:
+            return os.path.normcase(
+                os.path.abspath(os.path.expanduser(left))
+            ) == os.path.normcase(os.path.abspath(right_canonical))
+
+    @classmethod
+    def _resolve_explicit_abs_path_to_repo_and_rlinf(
+        cls,
+        abs_path: Path,
+        env_var_key: str,
+    ) -> tuple[Path, Path]:
+        resolved = abs_path.expanduser().resolve()
+        if not resolved.is_dir():
+            raise FileNotFoundError(
+                f"{env_var_key} points to a non-directory path: {resolved}"
+            )
+        if (resolved / "pyproject.toml").is_file() and (
+            resolved / "rlinf" / "__init__.py"
+        ).is_file():
+            return resolved, resolved / "rlinf"
+        if resolved.name == "rlinf" and (resolved / "__init__.py").is_file():
+            return resolved.parent, resolved
+        raise RuntimeError(
+            f"{env_var_key}={resolved}: expected a repository root with "
+            "pyproject.toml and rlinf/__init__.py, or an absolute path to "
+            "the rlinf package directory."
+        )
+
+    @classmethod
+    def _strip_sync_roots_from_pythonpath(
+        cls,
+        env_vars: dict[str, str],
+        strip_roots: tuple[str, ...],
+    ) -> dict[str, str]:
+        """Drop PYTHONPATH segments that duplicate shipped paths (Ray injects ``py_modules``)."""
+        if not strip_roots:
+            return env_vars
+        out = dict(env_vars)
+        k = "PYTHONPATH"
+        if k not in out:
+            return out
+        kept = [
+            e
+            for e in Cluster._split_path_entries(out[k])
+            if not any(cls._paths_equivalent_for_code_sync(e, r) for r in strip_roots)
+        ]
+        if kept:
+            out[k] = os.pathsep.join(kept)
+        else:
+            del out[k]
+        return out
+
+    @classmethod
+    def _prepare_ray_code_sync_runtime_env_fragment(
+        cls,
+    ) -> tuple[Optional[dict[str, Any]], tuple[str, ...]]:
+        """Build Ray ``runtime_env`` with ``py_modules`` for the ``rlinf`` package only."""
+        env_key = cls.get_full_env_var_name(ClusterEnvVar.CODE_WORKING_DIR)
+        raw = (os.environ.get(env_key) or "").strip()
+
+        lowered = raw.lower()
+        if lowered in {"0", "false", "no", "off"}:
+            return None, ()
+
+        if raw == "":
+            return None, ()
+        if lowered == "auto":
+            repo_root = Path(cls._infer_rlinf_repo_root_for_ray_working_dir())
+        else:
+            path_obj = Path(raw).expanduser()
+            if not path_obj.is_absolute():
+                raise RuntimeError(
+                    f"{env_key} must be 'auto', an absolute path, or unset/0/off for no sync; "
+                    f"got {raw!r}."
+                )
+            repo_root, rlinf_pkg = cls._resolve_explicit_abs_path_to_repo_and_rlinf(
+                path_obj, env_key
+            )
+            if not (rlinf_pkg / "__init__.py").is_file():
+                raise FileNotFoundError(
+                    f"rlinf package missing or invalid at {rlinf_pkg}."
+                )
+            py_mod_path = rlinf_pkg.resolve()
+            fragment: dict[str, Any] = {"py_modules": [str(py_mod_path)]}
+            strip_roots = {
+                os.path.realpath(str(repo_root)),
+                os.path.realpath(str(rlinf_pkg)),
+                os.path.realpath(str(py_mod_path)),
+            }
+            return fragment, tuple(sorted(strip_roots))
+
+        rlinf_pkg = repo_root / "rlinf"
+        if not (rlinf_pkg / "__init__.py").is_file():
+            raise FileNotFoundError(
+                f"rlinf package missing or invalid at {rlinf_pkg} (repo root {repo_root})."
+            )
+        py_mod_path = rlinf_pkg.resolve()
+        fragment = {"py_modules": [str(py_mod_path)]}
+        strip_roots = {
+            os.path.realpath(str(repo_root)),
+            os.path.realpath(str(rlinf_pkg)),
+            os.path.realpath(str(py_mod_path)),
+        }
+        return fragment, tuple(sorted(strip_roots))

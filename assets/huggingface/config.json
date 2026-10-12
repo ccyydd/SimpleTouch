@@ -1,0 +1,20 @@
+{
+  "model_name": "SimpleTouch",
+  "format": "simpletouch_inference_bundle",
+  "format_version": 1,
+  "checkpoint_step": 20000,
+  "task_checkpoints": {
+    "lift_bottle": {"path": "lift_bottle/global_step_20000", "execution_horizon": 50},
+    "pull_out_key": {"path": "pull_out_key/global_step_20000", "execution_horizon": 50},
+    "lift_can": {"path": "lift_can/global_step_20000", "execution_horizon": 50},
+    "put_bottle_in_shelf": {"path": "put_bottle_in_shelf/global_step_20000", "execution_horizon": 50},
+    "insert_hole": {"path": "insert_hole/global_step_20000", "execution_horizon": 25},
+    "insert_tube": {"path": "insert_tube/global_step_20000", "execution_horizon": 25}
+  },
+  "checkpoint_files": [
+    "actor/model_state_dict/full_weights.pt",
+    "config.yaml",
+    "norm_stats.json",
+    "_SUCCESS"
+  ]
+}

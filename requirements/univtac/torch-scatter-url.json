@@ -1,0 +1,6 @@
+{
+  "commit": "0dafa10262e22f486f160a55d6f11aeab12d8e7b",
+  "path": "third_party/TacEx/source/tacex/setup.py",
+  "old": "https://data.pyg.org/whl/torch-2.8.0%2Bcu128/torch_scatter-2.1.2%2Bpt28cu128-cp310-cp310-linux_x86_64.whl",
+  "new": "https://data.pyg.org/whl/torch-2.5.0%2Bcu124/torch_scatter-2.1.2%2Bpt25cu124-cp310-cp310-linux_x86_64.whl"
+}

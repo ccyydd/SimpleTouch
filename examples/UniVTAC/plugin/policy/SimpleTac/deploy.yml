@@ -1,0 +1,9 @@
+policy_name: SimpleTac
+host: 127.0.0.1
+port: 8000
+# IH/Insert Tube: 25; other tasks: full checkpoint chunk. Numbers override this.
+execution_horizon: task
+use_tactile: false
+task_name: insert_hole
+instruction_type: seen
+instuction_file: null

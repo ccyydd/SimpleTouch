@@ -1,0 +1,116 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simpletouch"
+version = "0.1.0"
+authors = [{ name = "SimpleTouch Authors" }]
+description = "Tactile-expert policy for UniVTAC contact-rich manipulation"
+readme = {file = "README.md", content-type = "text/markdown"}
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+keywords = [
+    "robotics",
+    "tactile-policy",
+    "vision-language-action",
+    "univtac",
+]
+classifiers = [
+    #   2 - Pre-Alpha
+    #   3 - Alpha
+    #   4 - Beta
+    #   5 - Production/Stable
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: GPU :: NVIDIA CUDA :: 12 :: 12.4",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+]
+
+
+dependencies = [
+    # Core System
+    # These are the dependencies of the core scheduler
+    "ray[default]>=2.47.0",
+    "torch>=2.5.0",
+    "hydra-core",
+    "numpy",
+
+    # Data processing
+    "datasets",
+    "torchdata",
+    "scipy",
+
+    # Utilities
+    "accelerate",
+    "einops",
+    "nvitop",
+    "pybind11",
+    "setuptools",
+    "ninja",
+    "liger_kernel; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "huggingface_hub",
+
+    # Logging
+    "tensorboard",
+
+    "sortedcontainers"
+]
+
+[project.urls]
+Homepage = "https://simpletouch-robot.github.io/"
+
+[project.optional-dependencies]
+embodied = [
+    "transformers<=4.57.6",
+    "torchcodec",
+    "timm",
+    "imageio[ffmpeg]",
+    "gymnasium",
+    "gym",
+]
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rlinf*"]
+exclude = ["tests*", "docs*", "examples*", "docker*", "toolkits*"]
+
+[tool.setuptools.package-data]
+rlinf = ["**/*.yaml", "**/*.yml"]
+
+[tool.ruff]
+line-length = 88
+indent-width = 4
+target-version = "py311"
+
+[tool.ruff.lint]
+isort = {known-first-party = ["rlinf"]}
+select = ["C", "E", "F", "I", "W", "CPY001", "RUF013", "UP006", "PERF102", "PLC1802", "PLC0208", "D", "RUF002", "DOC102", "DOC202", "DOC403", "DOC502"]
+ignore = [
+    "C901", # "complex-structure"
+    "E501", # "line-too-long"
+    "E741", # "ambiguous-variable-name"
+    "D100", # "Missing docstring in public module"
+    "D104", # "Missing docstring in public package"
+    "D203", # "incorrect-blank-line-before-class", conflict with D211,
+    "D213", # "multi-line-summary-second-line", conflict with D212
+]
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.lint.per-file-ignores]
+# Only enable docstring check for the scheduler module for now.
+"!rlinf/scheduler/**.py" = ["D", "RUF002"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+docstring-code-format = true
+docstring-code-line-length = "dynamic"

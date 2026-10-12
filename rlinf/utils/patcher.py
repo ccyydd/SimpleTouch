@@ -1,0 +1,335 @@
+# Copyright 2025 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import importlib
+import inspect
+import sys
+import types
+from importlib.machinery import ModuleSpec
+from typing import Callable
+
+
+class _StubModuleFinder:
+    def find_spec(self, fullname: str, path=None, target=None):
+        if "." not in fullname:
+            return None
+
+        parent_name = fullname.rsplit(".", 1)[0]
+        parent = sys.modules.get(parent_name)
+        if isinstance(parent, _StubModule):
+            return ModuleSpec(fullname, self, is_package=True)
+        return None
+
+    def create_module(self, spec):
+        return _StubModule(spec.name)
+
+    def exec_module(self, module):
+        sys.modules[module.__name__] = module
+
+
+class _StubModule(types.ModuleType):
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.__file__ = f"<stub:{name}>"
+        self.__loader__ = None
+        self.__package__ = name.rsplit(".", 1)[0] if "." in name else name
+        self.__path__ = []
+        self.__all__ = []
+        self.__spec__ = ModuleSpec(name, None, is_package=True)
+
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(
+                f"'{type(self).__name__}' object has no attribute '{name}'"
+            )
+
+        submodule_name = f"{self.__name__}.{name}"
+        if submodule_name not in sys.modules:
+            sys.modules[submodule_name] = _StubModule(submodule_name)
+        return sys.modules[submodule_name]
+
+    def __call__(self, *args, **kwargs):
+        return None
+
+    def __iter__(self):
+        return iter([])
+
+    def __contains__(self, item):
+        return False
+
+    def __len__(self):
+        return 0
+
+    def __bool__(self):
+        return False
+
+
+_stub_module_finder = _StubModuleFinder()
+if _stub_module_finder not in sys.meta_path:
+    sys.meta_path.insert(0, _stub_module_finder)
+
+
+def _register_stub_module(module_path: str) -> _StubModule:
+    parts = module_path.split(".")
+    for index in range(len(parts)):
+        current_path = ".".join(parts[: index + 1])
+        if current_path not in sys.modules:
+            sys.modules[current_path] = _StubModule(current_path)
+
+        if index > 0:
+            parent_path = ".".join(parts[:index])
+            parent = sys.modules.get(parent_path)
+            # Only attach children onto stub parents
+            if _is_stub_module(parent):
+                setattr(parent, parts[index], sys.modules[current_path])
+
+    return sys.modules[module_path]
+
+
+def _is_stub_module(module):
+    return isinstance(module, _StubModule)
+
+
+class _Patcher:
+    def __init__(self):
+        self._mappings_dict: dict[str, str] = {}
+        self._wrappers_dict: dict[str, list[Callable]] = {}
+
+    def clear(self):
+        self._mappings_dict = {}
+        self._wrappers_dict = {}
+        self._mappings = {}
+        self._traced_module = set()
+        self._traced_func = set()
+        self._traced_cls = set()
+
+    @staticmethod
+    def _get_parent_obj_and_obj(name: str):
+        name_list = name.split(".")
+        if len(name_list) == 1:
+            try:
+                curr_obj = importlib.import_module(name)
+                return None, curr_obj
+            except ModuleNotFoundError:
+                return None, None
+        obj_list = []
+        for i in range(1, len(name_list) + 1):
+            # parent = ".".join(name_list[: i - 1])
+            path = ".".join(name_list[:i])
+            try:
+                curr_obj = importlib.import_module(path)
+                obj_list.append(curr_obj)
+            except ModuleNotFoundError:
+                if i == 1:
+                    raise RuntimeError(f"prefix object not found in {name}")
+
+                for j in range(i - 2, len(name_list) - 2):
+                    if hasattr(obj_list[j], name_list[j + 1]):
+                        obj_list.append(getattr(obj_list[j], name_list[j + 1]))
+                    else:
+                        raise RuntimeError(f"prefix object not found in {name}")
+                if hasattr(obj_list[-1], name_list[-1]):
+                    return obj_list[-1], getattr(obj_list[-1], name_list[-1])
+                else:
+                    return obj_list[-1], None
+        return obj_list[-2], obj_list[-1]
+
+    def _parse_mappings(self):
+        # parse all objs and build self._mappings
+        self._mappings = {}
+        for old, new in self._mappings_dict.items():
+            new_parent_obj, new_obj = self._get_parent_obj_and_obj(new)
+            if new_obj is None:
+                raise RuntimeError(f"object not exist: {new}")
+            if old in self._wrappers_dict:
+                for wrapper in self._wrappers_dict[old]:
+                    new_obj = wrapper(new_obj)
+            old_parent_obj, old_obj = self._get_parent_obj_and_obj(old)
+
+            if new_parent_obj is None or old_parent_obj is None:
+                assert inspect.ismodule(new_obj), f"new object is not a module: {new}"
+
+            # When the old_parent_object is a class, check whether the old object is actually a patched function from the *parent class* (not the current class).
+            # If so, set old_obj to None to avoid triggering the repatch assertion below.
+            if old_obj is not None:
+                if inspect.isclass(old_parent_obj):
+                    attr_name = old.split(".")[-1]
+                    # Use super to get the parent class
+                    parent_attr = getattr(
+                        super(old_parent_obj, old_parent_obj), attr_name, None
+                    )
+                    if parent_attr == old_obj:
+                        old_obj = None
+
+            if old_obj is None:
+                # create temparary dummy object, which will be replaced by new_obj in apply stage
+                from unittest.mock import Mock
+
+                old_obj = Mock(
+                    side_effect=KeyError(
+                        "patcher internal error, dummy object not replaced"
+                    )
+                )
+                if inspect.ismodule(new_obj):
+                    sys.modules[old] = old_obj
+                if old_parent_obj is not None:
+                    setattr(old_parent_obj, old.split(".")[-1], old_obj)
+
+            assert id(old_obj) not in self._mappings, (
+                f"do not support re_patch! old object is [{repr(old_obj)}], news objects are [{repr(self._mappings[id(old_obj)])}] and [{repr(new_obj)}]"
+            )
+            self._mappings[id(old_obj)] = new_obj
+
+    def _apply_to_class(self, cls):
+        # patch member functions and member classes in classes
+        if cls in self._traced_cls:
+            return
+        self._traced_cls.add(cls)
+
+        for k, v in cls.__dict__.items():
+            # most function with prefix '__' means it's an inner operator or variable
+            # that should no be patched. We will not patch them execpt __init__ which
+            # is frequently used and should be patched.
+            if k.startswith("ORIG__"):
+                continue
+
+            if inspect.isclass(v):
+                Patcher._apply_to_class(v)
+
+            patch_target_obj = None
+            original_id = -1
+
+            if isinstance(v, staticmethod):
+                # If it's a staticmethod descriptor, get the underlying function
+                patch_target_obj = v.__func__
+                original_id = id(patch_target_obj)
+            elif isinstance(v, classmethod):
+                # If it's a classmethod descriptor, get the underlying function
+                patch_target_obj = v.__func__
+                original_id = id(patch_target_obj)
+            else:
+                # For regular methods or other attributes
+                patch_target_obj = v
+                original_id = id(patch_target_obj)
+
+            if original_id in self._mappings:
+                new_obj = self._mappings[original_id]
+
+                if id(cls) in self._mappings:
+                    raise RuntimeError(
+                        f"Patcher: cannot patch a class and the attr in this class meanwhile! "
+                        f"cls is [{repr(cls)}], attr is [{repr(v)}]"
+                    )
+
+                # Re-wrap if necessary
+                if isinstance(v, staticmethod):
+                    setattr(cls, k, staticmethod(new_obj))
+                elif isinstance(v, classmethod):
+                    setattr(cls, k, classmethod(new_obj))
+                else:
+                    setattr(cls, k, new_obj)
+
+    def _apply_to_modules(self):
+        self._traced_module = set()
+        self._traced_func = set()
+        self._traced_cls = set()
+        keys_to_patch = []
+        for key, value in sys.modules.copy().items():
+            if id(value) in self._mappings:
+                keys_to_patch.append(key)
+                sys.modules[key] = self._mappings[id(value)]
+
+        for key in keys_to_patch:
+            for k, v in sys.modules.copy().items():
+                if k.startswith(key) and k != key:
+                    del sys.modules[k]
+
+        for key, value in sys.modules.copy().items():
+            for k, v in value.__dict__.copy().items():
+                if k.startswith("ORIG__"):
+                    continue
+
+                if inspect.isclass(v):
+                    self._apply_to_class(v)
+
+                if id(v) in self._mappings:
+                    setattr(value, k, self._mappings[id(v)])
+
+    def add_patch(self, old: str, new: str):
+        assert isinstance(old, str)
+        assert isinstance(new, str)
+        if old in self._mappings_dict:
+            raise RuntimeError(
+                f"do not support re_patch! old object is [{old}], new objects are [{self._mappings_dict[old]}] and [{new}]"
+            )
+        self._mappings_dict[old] = new
+
+    def add_wrapper(self, old: str, wrapper: types.FunctionType):
+        assert isinstance(old, str)
+        if wrapper is None:
+            raise RuntimeError(f"wrapper is None in add_wrapper, old is [{old}]")
+        assert callable(wrapper)
+        if old not in self._wrappers_dict:
+            self._wrappers_dict[old] = []
+        self._wrappers_dict[old].append(wrapper)
+
+    def skip_import(self, *module_paths: str) -> "_Patcher":
+        """Register stub modules so ``import <path>`` succeeds without the real dep.
+
+        For each path not already imported, installs a no-op stub in
+        ``sys.modules`` (and, via the meta-path finder, for its submodules).
+        Use this to satisfy an optional/unavailable dependency's import site;
+        pair with :meth:`clear_stub_import` to remove the stub before code that
+        must observe the dependency's real (absent) state runs. Returns ``self``
+        for chaining.
+        """
+        for module_path in module_paths:
+            assert isinstance(module_path, str)
+            if module_path in sys.modules:
+                continue
+
+            _register_stub_module(module_path)
+        return self
+
+    def clear_stub_import(self, *module_paths: str) -> "_Patcher":
+        """Remove stub modules previously installed by :meth:`skip_import`.
+
+        Drops the given paths and their stubbed submodules from ``sys.modules``,
+        but only entries that are stubs — real modules imported in the meantime
+        are left untouched. Returns ``self`` for chaining.
+        """
+        for module_path in module_paths:
+            assert isinstance(module_path, str)
+            for module_name in list(sys.modules):
+                if module_name == module_path or module_name.startswith(
+                    f"{module_path}."
+                ):
+                    module = sys.modules.get(module_name)
+                    if _is_stub_module(module):
+                        sys.modules.pop(module_name, None)
+        return self
+
+    def apply(self):
+        for old in self._wrappers_dict:
+            if old not in self._mappings_dict:
+                self._mappings_dict[old] = old
+
+        if len(self._mappings_dict) == 0:
+            return
+
+        self._parse_mappings()
+        self._apply_to_modules()
+
+
+Patcher = _Patcher()
