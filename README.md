@@ -150,6 +150,10 @@ SIMPLETOUCH_NUM_GPUS=8 bash scripts/simpletouch/train_univtac.sh
 
 For another task, change `SIMPLETOUCH_TASK` and the corresponding paths. Training requires the generated `<cache-root>/<task>/manifest.json`; it does not build the cache automatically. Set `SIMPLETOUCH_OUTPUT_ROOT` to change the default `outputs/` directory.
 
+## 🛠️ Piper Gripper Hardware
+
+The [Piper gripper hardware for GelSight Mini](hardware/piper-gelsight-mini/README.md) includes printable STL files for the base and two reinforced bracket variants, a bill of materials, and an illustrated assembly guide in Chinese and English. The guide documents deformation observed during use of the original parts and the subsequent reinforcement changes.
+
 ## ⚖️ License
 
 This repository retains the [Apache-2.0 license](LICENSE). Third-party models, datasets, simulators, and dependencies have their own licenses and access requirements.
