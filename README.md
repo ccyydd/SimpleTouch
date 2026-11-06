@@ -150,6 +150,10 @@ SIMPLETOUCH_NUM_GPUS=8 bash scripts/simpletouch/train_univtac.sh
 
 For another task, change `SIMPLETOUCH_TASK` and the corresponding paths. Training requires the generated `<cache-root>/<task>/manifest.json`; it does not build the cache automatically. Set `SIMPLETOUCH_OUTPUT_ROOT` to change the default `outputs/` directory.
 
+## 🛠️ Piper Gripper Hardware
+
+See the [Piper gripper hardware setup for GelSight Mini](hardware/piper-gelsight-mini/docs/README.md).
+
 ## ⚖️ License
 
 This repository retains the [Apache-2.0 license](LICENSE). Third-party models, datasets, simulators, and dependencies have their own licenses and access requirements.
