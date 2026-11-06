@@ -152,7 +152,7 @@ For another task, change `SIMPLETOUCH_TASK` and the corresponding paths. Trainin
 
 ## 🛠️ Piper Gripper Hardware
 
-The [Piper gripper hardware for GelSight Mini](hardware/piper-gelsight-mini/README.md) includes printable STL files for the base and two reinforced bracket variants, a bill of materials, and an illustrated assembly guide in Chinese and English. The guide documents deformation observed during use of the original parts and the subsequent reinforcement changes.
+The [Piper gripper hardware for GelSight Mini](hardware/piper-gelsight-mini/docs/README.md) includes printable STL files for the base and two reinforced bracket variants, a bill of materials, and an illustrated assembly guide in Chinese and English. The guide documents deformation observed during use of the original parts and the subsequent reinforcement changes.
 
 ## ⚖️ License
 

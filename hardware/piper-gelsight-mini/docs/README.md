@@ -5,9 +5,9 @@ This package contains the gripper base and the right- and left-reinforced bracke
 
 | 结构预览 / Preview | 文件 / File | 内容 / Part | 尺寸 / Size (mm) |
 | --- | --- | --- | --- |
-| <img src="gelsight_gripper_base.png" width="200" alt="夹爪底座 / Gripper base"> | [gelsight_gripper_base.stl](gelsight_gripper_base.stl) | 原始夹爪底座 / Original gripper base | 56 × 16.25 × 24.5 |
-| <img src="gelsight_gripper_right_v9.png" width="200" alt="右侧三角板 V9 / Right-reinforced V9"> | [gelsight_gripper_right_v9.stl](gelsight_gripper_right_v9.stl) | 右侧三角板结构件 / Right-reinforced bracket | 56 × 74.75 × 28.5 |
-| <img src="gelsight_gripper_left_v10.png" width="200" alt="左侧三角板 V10 / Left-reinforced V10"> | [gelsight_gripper_left_v10.stl](gelsight_gripper_left_v10.stl) | 左侧三角板结构件 / Left-reinforced bracket | 56 × 74.75 × 28.5 |
+| <img src="../fig/gelsight_gripper_base.png" width="200" alt="夹爪底座 / Gripper base"> | [gelsight_gripper_base.stl](../gelsight_gripper_base.stl) | 原始夹爪底座 / Original gripper base | 56 × 16.25 × 24.5 |
+| <img src="../fig/gelsight_gripper_right_v9.png" width="200" alt="右侧三角板 V9 / Right-reinforced V9"> | [gelsight_gripper_right_v9.stl](../gelsight_gripper_right_v9.stl) | 右侧三角板结构件 / Right-reinforced bracket | 56 × 74.75 × 28.5 |
+| <img src="../fig/gelsight_gripper_left_v10.png" width="200" alt="左侧三角板 V10 / Left-reinforced V10"> | [gelsight_gripper_left_v10.stl](../gelsight_gripper_left_v10.stl) | 左侧三角板结构件 / Left-reinforced bracket | 56 × 74.75 × 28.5 |
 
 ## 材料清单 / Bill of materials
 
@@ -44,7 +44,7 @@ Printed parts are listed above.
 
 The photos below show base mounting, sensor installation, and deformation observed during use. They illustrate assembly positions and the motivation for the revisions; the photographed parts do not represent the final V9/V10 reinforced geometry in this package.
 
-![底座与传感器安装、使用中变形四联图 / Four-panel installation and deformation reference](assembly-guide.png)
+![底座与传感器安装、使用中变形四联图 / Four-panel installation and deformation reference](../fig/assembly-guide.png)
 
 1. **底座侧视（图 01）**：对照蓝色底座与 Piper 末端夹爪电机驱动结构的相对位置安装。2 个 M3 热熔螺母嵌入底座，用于该连接位置。
 
